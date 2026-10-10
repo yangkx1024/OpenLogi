@@ -1,0 +1,155 @@
+# Lives only on the nix-cachix branch of the fork (yangkx1024/OpenLogi): syncs
+# upstream master every night, builds the packages this machine uses and pushes
+# them to yangkx.cachix.org.
+#
+# This branch must be the fork's default branch: schedules only fire on the
+# default branch, and since it carries only this workflow, upstream's scheduled
+# jobs (Nix CI, flake-lock updates, Crowdin, ...) stop running on the fork. The
+# sync job also disables every other workflow registered on the fork, so
+# upstream workflows on other branches stay idle too.
+#
+# Branch = upstream master plus one commit on top. That commit drops
+# .github/workflows/ and adds this branch's own .github/workflows/. Every sync
+# replays it onto the latest upstream master and force-pushes, keeping its
+# author and message, so the history is always upstream's plus one commit. To
+# change this workflow, amend that commit instead of adding another: the sync
+# only carries the topmost commit.
+#
+# The Flake lives in packaging/ (the root flake.nix is upstream's deprecated
+# alias, with no committed lock), so consumers take
+# github:yangkx1024/OpenLogi/nix-cachix?dir=packaging. packaging/linux/package.nix
+# picks its source with lib.fileset and leaves out .github, so the store paths
+# built here are identical to those built from upstream master with the same
+# packaging/flake.lock.
+#
+# Required secret: CACHIX_AUTH_TOKEN (write token for the yangkx cache).
+name: Nix Cachix
+
+on:
+  schedule:
+    # Daily at 00:00 Asia/Shanghai (UTC+08:00).
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: nix-cachix
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  UPSTREAM: AprilNEA/OpenLogi
+  UPSTREAM_BRANCH: master
+  CACHIX_NAME: yangkx
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    outputs:
+      sha: ${{ steps.sync.outputs.sha }}
+    steps:
+      # Needs the parent of the fork commit to tell whether upstream moved.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+
+      - name: Sync upstream master
+        id: sync
+        run: |
+          git fetch --no-tags --depth=1 "https://github.com/$UPSTREAM.git" "$UPSTREAM_BRANCH"
+          upstream=$(git rev-parse FETCH_HEAD)
+          git read-tree FETCH_HEAD
+          git rm -r -q --cached --ignore-unmatch -- .github/workflows
+          git ls-tree -r HEAD -- .github/workflows | git update-index --index-info
+          tree=$(git write-tree)
+          if [ "$(git rev-parse HEAD^)" = "$upstream" ] && [ "$tree" = "$(git rev-parse 'HEAD^{tree}')" ]; then
+            echo "Already at $UPSTREAM@$upstream"
+            sha=$(git rev-parse HEAD)
+          else
+            sha=$(git log -1 --format=%B | GIT_AUTHOR_NAME="$(git log -1 --format=%an)" GIT_AUTHOR_EMAIL="$(git log -1 --format=%ae)" GIT_AUTHOR_DATE="$(git log -1 --format=%aD)" \
+              git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit-tree "$tree" -p FETCH_HEAD)
+            git push --force-with-lease="$GITHUB_REF_NAME:$(git rev-parse HEAD)" origin "$sha:refs/heads/$GITHUB_REF_NAME"
+            echo "Rebased onto $UPSTREAM@$upstream as $sha"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # A workflow upstream adds is registered as active as soon as it appears
+      # on any branch of the fork; switch them off again every night.
+      - name: Disable upstream workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows" \
+            --jq '.workflows[] | select(.state == "active" and (.path | startswith(".github/workflows/")) and .path != ".github/workflows/nix-cachix.yml") | "\(.id) \(.path)"' |
+          while read -r id path; do
+            echo "Disabling $path"
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$id/disable"
+          done
+
+  build:
+    needs: sync
+    runs-on: ubuntu-latest
+    env:
+      # Only what the system actually installs and cache.nixos.org lacks, so the
+      # cache does not fill up with unused outputs.
+      PACKAGES: openlogi
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      # yangkx1024/nixos-flake takes this flake (?dir=packaging) without
+      # overriding its inputs, so evaluating it against packaging/flake.lock
+      # yields the same drv as the system. The output path already covers the
+      # source and the pinned nixpkgs/rust-overlay: if the cache has it,
+      # nothing changed and every later step is skipped.
+      - name: Find uncached packages
+        id: plan
+        run: |
+          for p in $PACKAGES; do
+            nix eval --json "./packaging#packages.x86_64-linux.$p" --apply 'p: { drv = p.drvPath; out = p.outPath; }'
+          done | jq -s . > "$RUNNER_TEMP/packages.json"
+          jq -r '.[] | "\(.drv) \(.out)"' "$RUNNER_TEMP/packages.json" | while read -r drv out; do
+            nix path-info --store "https://$CACHIX_NAME.cachix.org" "$out" > /dev/null 2>&1 || echo "$drv^*"
+          done > "$RUNNER_TEMP/missing"
+          cat "$RUNNER_TEMP/missing"
+          [ -s "$RUNNER_TEMP/missing" ] && echo "missing=true" >> "$GITHUB_OUTPUT" || echo "All packages already cached"
+
+      # The GPUI workspace build does not fit in the runner's stock free space.
+      - name: Free disk space
+        if: steps.plan.outputs.missing
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      # Substituter only; the last step pushes the output closures, keeping
+      # intermediate build inputs (vendored crates, toolchain) out of the cache.
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        if: steps.plan.outputs.missing
+        with:
+          name: ${{ env.CACHIX_NAME }}
+          skipPush: true
+
+      # The evaluation above already wrote the .drv files to the store.
+      - name: Build
+        id: build
+        if: steps.plan.outputs.missing
+        run: xargs nix build --no-link -L --keep-going < "$RUNNER_TEMP/missing"
+
+      # Push whatever did build even if one package failed.
+      - name: Push to Cachix
+        if: ${{ !cancelled() && steps.build.outcome != 'skipped' }}
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          mapfile -t outs < <(jq -r '.[].out' "$RUNNER_TEMP/packages.json" | while read -r out; do [ ! -e "$out" ] || echo "$out"; done)
+          [ "${#outs[@]}" -eq 0 ] || cachix push "$CACHIX_NAME" "${outs[@]}"
